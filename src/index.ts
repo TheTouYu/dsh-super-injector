@@ -600,10 +600,13 @@ export function apply(ctx: AppContext, config: Config): void {
 
   /** 该包是否已有 ACTIVE 的 loader entry（权威防重判断）。 */
   function hasActiveEntry(pkgName: string): boolean {
+    const urlSuffix = '/' + pkgName.split('/').pop() + '/lib/index.js'
     for (const entry of ctx.loader.entries()) {
       const opts = entry.options
       if (opts.group) continue
-      if (opts.name === pkgName && entry.fiber && FIBER_NAMES[entry.fiber.state] === 'active') return true
+      const nameOk = opts.name === pkgName ||
+        (opts.name.startsWith('file:') && opts.name.endsWith(urlSuffix))
+      if (nameOk && entry.fiber && FIBER_NAMES[entry.fiber.state] === 'active') return true
     }
     return false
   }
@@ -1676,10 +1679,12 @@ export function apply(ctx: AppContext, config: Config): void {
    * 虽已活跃优先，但残留多了会让状态列表失真、`waitFiberStable` 轮询错位。
    */
   function cleanupStaleEntries(name: string): void {
+    const urlSuffix = '/' + name.split('/').pop() + '/lib/index.js'
     for (const entry of ctx.loader.entries()) {
       const o = entry.options
       if (o.group) continue
-      if (o.name !== name) continue
+      const nameOk = o.name === name || (o.name.startsWith('file:') && o.name.endsWith(urlSuffix))
+      if (!nameOk) continue
       const st = entry.fiber ? FIBER_NAMES[entry.fiber.state] : 'no-fiber'
       if (st === 'active') continue
       try {
