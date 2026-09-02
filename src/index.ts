@@ -2102,6 +2102,18 @@ export function apply(ctx: AppContext, config: Config): void {
         if (!REGISTER_NAME.test(lib)) {
           problems.push(`lib/client.js 的 register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}）`)
         }
+        // ⚠️ __ModuleLoader__ 注册名 = package.json name（2026-09 dsh-file-explorer
+        // 事故教训：裸名第三方包改装进 @dsh-external/ scope 时只改了目录名和
+        // package.json，漏改 client.js 注册 id → 加载器按包名找不到注册 →
+        // 前端崩「loaded without registering … via __ModuleLoader__.load」）
+        try {
+          const pkgJson = JSON.parse(readFileSync(join(base, 'package.json'), 'utf8')) as { name?: string }
+          const pkgName = pkgJson?.name
+          const idMatch = pkgName && lib.match(/__ModuleLoader__\.load\(\s*\{[\s\S]*?id:\s*['"]([^'"]+)['"]/)
+          if (idMatch && idMatch[1] !== pkgName) {
+            problems.push(`lib/client.js 的 __ModuleLoader__.load 注册 id（${idMatch[1]}）≠ package.json name（${pkgName}）——加载器按包名找注册，不一致前端必崩（loaded without registering）；两处必须完全一致`)
+          }
+        } catch { /* package.json 读不到跳过 */ }
       }
       // 2. 源码骨架（有 src 时）
       const clientSrcPath = join(base, 'src', 'client', 'index.ts')
@@ -2398,7 +2410,7 @@ export function apply(ctx: AppContext, config: Config): void {
 
   safeRegister(defineTool({
     name: 'dev_inject_plugin',
-    description: '超级模组注入器：运行时注入任意本地 DSH 插件包（junction 链接 + loader.create，不碰 patch/package.json、不重启）。参数 = 插件包目录绝对路径（含 package.json 与 lib/）',
+    description: '超级模组注入器：运行时注入任意本地 DSH 插件包（junction 链接 + loader.create，不碰 patch/package.json、不重启）。参数 = 插件包目录绝对路径（含 package.json 与 lib/）。注入前自动校验 client 骨架 + 注册名（__ModuleLoader__.load id 必须等于 package.json name）+ 构建新鲜度，不通过会阻断并说明原因',
     parameters: {
       dir: { type: 'string', required: true, description: '插件包目录绝对路径（如 F:/dsh/03-dev-infra/dsh-xxx）' },
     },
@@ -3210,7 +3222,7 @@ export function apply(ctx: AppContext, config: Config): void {
     //    仓库、已注入插件、官方 packages 的服务面与构建模式），不重复造轮子；
     // 5) 使命：若注入器无法支撑此闭环，优先修复注入器。
     // ⚠️ 静态常量文本（缓存原则：静态到头）——严禁动态拼接。
-    text: '本环境装有 dsh-super-injector（dev_* 工具）：任意本地插件包可运行时注入——工具包/守护循环（timer+LLM 自主 agent loop）/UI 面板/混合形态，同一通道；注入即完整生效（host+UI）、可热重载与自重载、卸载即净。插件自身的提示词/工具/循环皆可自我优化；建新插件优先克隆/借鉴/重构生态已有资源（dsh-external 仓库、已注入插件、官方 packages 模式），不重复造轮子。若注入器无法支撑此闭环，优先修复注入器。从零体验路径：dev_plugin_status → dev_self_test → dev_scaffold_plugin → dev_build_plugin → dev_inject_plugin → dev_uninject_plugin。',
+    text: '本环境装有 dsh-super-injector（dev_* 工具）：任意本地插件包可运行时注入——工具包/守护循环（timer+LLM 自主 agent loop）/UI 面板/混合形态，同一通道；注入即完整生效（host+UI）、可热重载与自重载、卸载即净。插件自身的提示词/工具/循环皆可自我优化；建新插件优先克隆/借鉴/重构生态已有资源（dsh-external 仓库、已注入插件、官方 packages 模式），不重复造轮子。若注入器无法支撑此闭环，优先修复注入器。从零体验路径：dev_plugin_status → dev_self_test → dev_scaffold_plugin → dev_build_plugin → dev_inject_plugin → dev_uninject_plugin。插件 client 注册铁律：lib/client.js 的 __ModuleLoader__.load({ id }) 必须与 package.json 的 name 完全一致（含 scope，如 @dsh-external/dsh-xxx）——加载器按包名找注册，不一致前端必崩（loaded without registering）；把裸名第三方包改装进 @dsh-external/ 时，package.json name 与 client.js 注册 id 两处必须同步改名。',
     })
   } catch (e) {
     logger.warn('[super-injector] systemPrompt.context 重复注册容忍（跳过，新实例继续运行）: %s', e instanceof Error ? e.message : String(e))
