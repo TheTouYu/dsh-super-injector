@@ -1,4 +1,9 @@
 node_modules/
-lib/
 *.tsbuildinfo
 *.tgz
+
+# 注：lib/ 必须入库 —— package.json 的 main = ./lib/index.js。
+# 上游约定靠 prepare.mjs 在 npm install 时自包含构建，但实测新机器上
+# `npm install` 会因镜像缺包 404（@deepseek-ai/dsh-type-meta@0.0.1-rc.1），
+# 构建产物入库后 clone 即可用，与其余四个插件仓一致。
+!lib/
