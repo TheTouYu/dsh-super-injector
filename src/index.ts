@@ -27,7 +27,7 @@ import type SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type ToolRegistry from '@deepseek-ai/dsh-tools'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from 'schemastery'
-import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync } from 'node:fs'
+import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, unlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync } from 'node:fs'
 import { join, relative, dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { spawnSync } from 'node:child_process'
@@ -367,10 +367,9 @@ const SCAFFOLD_UI_CLIENT = (pkgName: string): string => `/**
  * = ['slots']（服务注入声明）；② register 必须带 name 字段（= slot 名，
  * 如 conversation.view）——缺 name 报 "slot undefined is not declared"。
  */
-import type { SlotsService } from '@deepseek-ai/dsh-client-ui-slots'
-
+// rc.1 起 ui-slots 并入 ui-renderer，上下文类型以官方 rc.1 插件为准
 type ClientContext = {
-  slots: SlotsService
+  slots: any
 }
 
 export const inject = ['slots']
@@ -404,8 +403,6 @@ const PLUGIN_ID = ${JSON.stringify(pkgName)}
 const CLIENT_EXTERNALS = [
   'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client',
   'cordis',
-  '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-runtime/client',
 ]
 
 const clientBundle: UserConfig = {
@@ -444,9 +441,6 @@ function scaffoldPackageJson(pkgName: string, description: string, form: string)
     'cordis': '>=4.0.0-rc <5',
     'schemastery': '^3.18.0',
   }
-  if (withClient) {
-    peerDeps['@deepseek-ai/dsh-client-ui-slots'] = '>=0.0.1-rc <2'
-  }
   const pkg: Record<string, unknown> = {
     name: pkgName,
     version: '0.0.1',
@@ -476,7 +470,7 @@ function scaffoldPackageJson(pkgName: string, description: string, form: string)
       './package.json': './package.json',
     }
     ;(pkg as Record<string, unknown>).dsh = {
-      client: { inject: ['@deepseek-ai/dsh-client-runtime', '@deepseek-ai/dsh-client-ui-slots'], platform: 'web' },
+      client: { inject: [], platform: 'web' },
     }
   }
   return JSON.stringify(pkg, null, 2) + '\n'
@@ -1983,6 +1977,31 @@ export function apply(ctx: AppContext, config: Config): void {
     return `OK: ${pkgName} 已注入（junction=${linkDir}）\n- host ${hostOk ? '✓' : '✗'}\n- ${client}`
   }
 
+  /**
+   * 删除一个 node_modules 链接（符号链接 / junction）。
+   * ⚠️ 必须用 lstatSync 判存在：existsSync 会跟随链接，目标已删的悬空链接返回 false，
+   *    导致「删除」被静默跳过而残留；且 rmdirSync 对符号链接抛 ENOTDIR（它只对目录有效）。
+   *    历史踩坑：两坑叠加使累计 11 次 uninject「报成功、链接实际残留」。
+   */
+  function removeLink(p: string): boolean {
+    try {
+      lstatSync(p)
+    } catch {
+      return false
+    }
+    try {
+      unlinkSync(p)
+      return true
+    } catch {
+      try {
+        rmdirSync(p)
+        return true
+      } catch {
+        return false
+      }
+    }
+  }
+
   /** 卸载一个已注入的插件包：卸 entry（fiber dispose）→ 清 registry → 删 junction。 */
   async function uninject(match: string, allowSelf = false): Promise<string> {
     // 自举卸载（allowSelf）：卸运行时 entry，保留 registry/junction/bundles 装配链，重启自动装回。
@@ -2040,8 +2059,7 @@ export function apply(ctx: AppContext, config: Config): void {
       const parts = fullName.startsWith('@') ? fullName.split('/') : [fullName]
       const linkDir = join(profileNodeModules, ...parts)
       try {
-        if (existsSync(linkDir)) {
-          rmdirSync(linkDir)
+        if (removeLink(linkDir)) {
           steps.push('junction 已删除: ' + linkDir)
         } else {
           steps.push('（junction 不存在）')
@@ -2086,7 +2104,10 @@ export function apply(ctx: AppContext, config: Config): void {
    * 等设置页卡片被误判为坏骨架；同时白名单外的陌生 slot 名仍视为异常，防 typo。 */
   const KNOWN_SLOTS = ['conversation.view', 'settings.plugin.item', 'settings.plugins.tab', 'settings.section', 'settings.general.item', 'conversation.session.header.actions', 'conversation.session.header.utilities', 'conversation.input.dock', 'conversation.composer.dock', 'sidebar.footer.action', 'shell.overlay']
   const SLOT_ALT = KNOWN_SLOTS.map((s) => s.replace(/\./g, '\\.')).join('|')
-  const REGISTER_NAME = new RegExp(`register\\(\\{[\\s\\S]*?name:\\s*['"](${SLOT_ALT})['"]`)
+  // ⚠️ 空白容忍（2026-09 file-explorer 误伤教训）：register( 与 { 之间的换行/缩进
+  // 是合法代码风格（esbuild 产物常见 register(\n  {），正则必须容忍——否则健康插件
+  // 被 restore-skip-bad-client 拒之门外。
+  const REGISTER_NAME = new RegExp(`register\\(\\s*\\{[\\s\\S]*?name:\\s*['"](${SLOT_ALT})['"]`)
 
   function clientSkeletonProblems(base: string): string[] {
     const problems: string[] = []
@@ -2096,10 +2117,14 @@ export function apply(ctx: AppContext, config: Config): void {
       const libClient = join(base, 'lib', 'client.js')
       if (existsSync(libClient)) {
         const lib = readFileSync(libClient, 'utf8')
-        if (!/inject\s*=\s*\[[^\]]*['"]slots['"]/.test(lib) && !/inject\s*:\s*\[[^\]]*['"]slots['"]/.test(lib)) {
+        // ⚠️ 存在性门（2026-09 browser-panel 误伤教训）：仅当 client 实际使用
+        // slots（ctx.slots / 解构 slots.register|inject）时才检查声明与注册——
+        // 不用 slots 的 client（如 better-sidebar registerTab 协议）不该被强制。
+        const slotsUsedLib = /ctx\.slots|\bslots\.(?:register|inject)\b/.test(lib)
+        if (slotsUsedLib && !/inject\s*=\s*\[[^\]]*['"]slots['"]/.test(lib) && !/inject\s*:\s*\[[^\]]*['"]slots['"]/.test(lib)) {
           problems.push('lib/client.js 缺 inject 含 slots（apply 用 ctx.slots 必须声明——cordis 服务注入契约）')
         }
-        if (!REGISTER_NAME.test(lib)) {
+        if (slotsUsedLib && !REGISTER_NAME.test(lib)) {
           problems.push(`lib/client.js 的 register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}）`)
         }
         // ⚠️ __ModuleLoader__ 注册名 = package.json name（2026-09 dsh-file-explorer
@@ -2119,10 +2144,12 @@ export function apply(ctx: AppContext, config: Config): void {
       const clientSrcPath = join(base, 'src', 'client', 'index.ts')
       if (existsSync(clientSrcPath)) {
         const src = readFileSync(clientSrcPath, 'utf8')
-        if (!/export const inject\s*=\s*\[[^\]]*['"]slots['"]/.test(src)) {
+        // 存在性门（同 lib 侧——不用 slots 的 client 不检查）
+        const slotsUsedSrc = /ctx\.slots|\bslots\.(?:register|inject)\b/.test(src)
+        if (slotsUsedSrc && !/export const inject\s*=\s*\[[^\]]*['"]slots['"]/.test(src)) {
           problems.push("src/client/index.ts 缺 export const inject = ['slots']（apply 用 ctx.slots 必须声明，否则报 cannot get property 'slots' without inject）")
         }
-        if (!REGISTER_NAME.test(src)) {
+        if (slotsUsedSrc && !REGISTER_NAME.test(src)) {
           problems.push(`slots.register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}——缺了报 slot undefined is not declared）`)
         }
       }
@@ -2243,7 +2270,7 @@ export function apply(ctx: AppContext, config: Config): void {
         const linkPath = join(linkDir, scope ? name.split('/')[1] as string : name)
         if (!isHealthyLink(linkPath)) {
           try {
-            if (existsSync(linkPath)) rmdirSync(linkPath)
+            removeLink(linkPath)
           } catch { /* 坏链接删除失败忽略 */ }
           try {
             mkdirSync(linkDir, { recursive: true })
