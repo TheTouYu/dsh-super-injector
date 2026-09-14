@@ -523,6 +523,107 @@ interface RegistryEntry {
 
 const FIBER_NAMES = ['pending', 'loading', 'active', 'failed', 'disposed', 'unloading']
 
+/**
+ * `fiber.dispose()` 等待上限（2026-09-11 实测事故的根因修复）。
+ *
+ * cordis 的 fiber disposer 是一个 await 插件初始化任务的包装器（`task =
+ * this._execute(runner)`，见 vendor/cordis/src/fiber.ts）——插件 `apply()`
+ * 只要没落定，`dispose()` 就跟着永久 pending。实测复现（cordis 4.0.2）：
+ * `apply` 抛错 → `state=4 (failed)` 且 dispose 立即落定；`apply` 永不落定
+ * → `state=1 (loading)` 且 dispose **永不落定**。
+ *
+ * 而 `logger.error` 只覆盖抛错路径，不覆盖「永不 settle」——于是重载工具
+ * 永久 await，调用它的会话 turn 卡死，`withOpLock` 链条一并锁死。
+ * 超时后不再等待：预活跃 fiber 的 apply 挂死时，其 dispose 已无可能完成，
+ * 继续等没有意义。
+ */
+const FIBER_DISPOSE_TIMEOUT_MS = 8_000
+
+/**
+ * 安全卸载一个 fiber：带超时，绝不永久挂住调用方。
+ *
+ * @param fiber — 目标 fiber（缺失或非对象时返回 `skipped`）。
+ * @param label — 审计/日志用的可读标识。
+ * @returns `ok` 正常卸载；`timeout` 超时放弃（调用方应判定该代已废弃）；
+ *   `skipped` 无可卸载对象。
+ */
+async function disposeFiberSafely(
+  fiber: any,
+  label: string,
+  onTimeout: (msg: string) => void,
+): Promise<'ok' | 'timeout' | 'skipped'> {
+  if (!fiber || typeof fiber.dispose !== 'function') return 'skipped'
+  // 状态快照必须在 dispose 之前取——dispose 会把 state 改掉。
+  const stateName = typeof fiber.state === 'number' ? (FIBER_NAMES[fiber.state] ?? String(fiber.state)) : '?'
+  let timer: NodeJS.Timeout | undefined
+  const outcome = await Promise.race<'ok' | 'timeout'>([
+    Promise.resolve()
+      .then(() => fiber.dispose())
+      .then(() => 'ok' as const, () => 'ok' as const), // dispose 抛错视为已卸载（清理失败不阻塞重建，与既有语义一致）
+    new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), FIBER_DISPOSE_TIMEOUT_MS)
+      timer.unref?.()
+    }),
+  ])
+  clearTimeout(timer)
+  if (outcome === 'timeout') {
+    onTimeout(
+      `${label}: fiber.dispose() 超过 ${FIBER_DISPOSE_TIMEOUT_MS / 1000}s 未落定（dispose 时 state=${stateName}）`
+      + '——该插件 apply() 疑似永不 settle，旧代清理已放弃。',
+    )
+  }
+  return outcome
+}
+
+/**
+ * 等待一批新建 fiber 完成初始化（loading → active），**带超时**。
+ *
+ * 生产事故：注入器 `registry.plugin()` 之后直接返回 `state=`（同步取到
+ * `loading`）就宣称重载成功，调用方看到的是半启动的插件（工具没注册、
+ * `acp_status` 报 unknown tool），并把它当成可用实例继续操作。这里等待
+ * 其真正落定；超时不再阻塞（超时即返回，由调用方在结果里标注）。
+ *
+ * @param fibers — 新建的 fiber 列表。
+ * @returns 稳定转 active 的数量，以及超时未稳定的标签列表。
+ */
+async function awaitFibersSettled(
+  fibers: any[],
+  timeoutMs: number,
+  labels: string[],
+): Promise<{ active: number; unsettled: string[] }> {
+  const pending = fibers.map((fiber, i) => {
+    const label = labels[i] ?? `fiber#${i}`
+    const wait = typeof fiber?.await === 'function' ? fiber.await() : Promise.resolve(fiber)
+    return Promise.resolve(wait).then(
+      () => ({ label, ok: true }),
+      (error: unknown) => ({ label, ok: false, error }),
+    )
+  })
+  if (!pending.length) return { active: 0, unsettled: [] }
+  let timer: NodeJS.Timeout | undefined
+  const settled = await Promise.race([
+    Promise.all(pending),
+    new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), timeoutMs)
+      timer.unref?.()
+    }),
+  ])
+  clearTimeout(timer)
+  if (settled === null) {
+    const states = fibers
+      .map((f, i) => `${labels[i] ?? `fiber#${i}`}=${FIBER_NAMES[f?.state] ?? '?'}`)
+      .join(', ')
+    return { active: 0, unsettled: [`${pending.length} 个新 fiber 在 ${timeoutMs / 1000}s 内未稳定（${states}）`] }
+  }
+  let active = 0
+  const unsettled: string[] = []
+  for (const r of settled) {
+    if (r.ok) active++
+    else unsettled.push(`${r.label}: ${String((r as { error?: unknown }).error).slice(0, 200)}`)
+  }
+  return { active, unsettled }
+}
+
 /** 递归收集 dir 下所有 .js 的相对路径指纹（mtime + size）。
  * E: 只统计 .js（运行时文件）——跳过 .map/.d.ts（构建产物，不参与运行，
  * 通常占一半以上）——正确性不变，stat 开销省 50%+。
@@ -551,14 +652,34 @@ function fingerprintOf(dir: string): string | null {
 }
 
 /**
+ * 操作锁超时（2026-09-11 实测事故）：目标插件的 `apply()` 永不落定时，
+ * 重载会永久 await 它的 fiber dispose —— 而 `opChain` 只在前一操作落定后
+ * 才放行，于是整个注入器（含所有 dev_* 工具）被一个挂死操作锁死，连自愈
+ * 入口都进不去。超时后放行链条：挂死操作仍无解，但后续操作可重试/自愈。
+ */
+const OP_LOCK_TIMEOUT_MS = 60_000
+
+/**
  * 操作互斥锁：注入/卸载/重载/安装全部串行执行（多会话并发调用注入器时，
  * 后操作排队等前操作完成——避免同一插件被并发重载/卸载的竞态）。
+ * 单操作超时后解锁（见 {@link OP_LOCK_TIMEOUT_MS}），后续操作不再被挂死的前序阻塞。
  */
 let opChain: Promise<unknown> = Promise.resolve()
 function withOpLock<T>(fn: () => Promise<T> | T): Promise<T> {
   const run = opChain.then(() => fn(), () => fn())
-  opChain = run.then(() => undefined, () => undefined)
-  return run
+  let timer: NodeJS.Timeout | undefined
+  const guard = Promise.race([
+    run,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(
+        `操作锁超时（${OP_LOCK_TIMEOUT_MS / 1000}s 未落定）——本次操作疑似 await 某个永不 settle 的 Promise`
+        + '（典型：重载目标 fiber 的 apply() 挂住 → dispose() 永不返回）。已放行后续操作，本次操作被放弃。',
+      )), OP_LOCK_TIMEOUT_MS)
+      timer.unref?.()
+    }),
+  ])
+  opChain = guard.then(() => undefined, () => undefined)
+  return guard.finally(() => clearTimeout(timer))
 }
 
 export function apply(ctx: AppContext, config: Config): void {
@@ -1165,10 +1286,9 @@ export function apply(ctx: AppContext, config: Config): void {
             const fiber = entry.fiber
             if (fiber && typeof fiber === 'object') {
               // 尝试用新插件导出重建 fiber（entry 的 plugin 引用替换）
-              // ⚠️ 先 await 旧 fiber dispose（异步清理防注册竞态）
-              if (typeof fiber.dispose === 'function') {
-                try { await fiber.dispose() } catch { /* 忽略 */ }
-              }
+              // ⚠️ 先 await 旧 fiber dispose（异步清理防注册竞态）；带超时，
+              // apply() 永不 settle 时 dispose 永不落定（见 FIBER_DISPOSE_TIMEOUT_MS）。
+              await disposeFiberSafely(fiber, match, () => { /* 兜底路径不再报错，下方以 state 判定 */ })
               const registry = (ctx as any).registry
               if (registry && typeof registry.delete === 'function' && typeof registry.plugin === 'function') {
                 registry.delete(fiber)
@@ -1195,8 +1315,12 @@ export function apply(ctx: AppContext, config: Config): void {
         return o?.name && String(o.name).includes(match)
       })
       if (target?.fiber) {
+        // 旧代清理：带超时（见 FIBER_DISPOSE_TIMEOUT_MS）。此处曾用裸
+        // `await target.fiber.dispose()`——目标 apply() 永不 settle 时该 await
+        // 永久挂住，重载工具永不返回、opChain 一并锁死（2026-09-11 事故）。
+        const abandoned: string[] = []
+        await disposeFiberSafely(target.fiber, match, (m) => abandoned.push(m))
         try {
-          if (typeof target.fiber.dispose === 'function') await target.fiber.dispose()
           const backup2 = new Map<string, any>()
           for (const u of urls) {
             backup2.set(u, loadCache.get(u))
@@ -1207,9 +1331,23 @@ export function apply(ctx: AppContext, config: Config): void {
           nf2.entry = target
           target.fiber = nf2
           normalizeEntriesByName(match)
-          return `OK: registry 无 runtime，entry.fiber 直接重建（state=${nf2.state}）`
+          // ⚠️ 必须等新 fiber 落定再返回：registry.plugin() 同步返回的 fiber 还是
+          // loading（state=1）。此前直接回报 `state=${nf2.state}` 就宣称成功——
+          // 调用方拿到的是半启动实例（工具未注册、acp_status 报 unknown tool），
+          // 并在此基础上继续操作，最终触发 dispose 挂死的事故。
+          const settled = await awaitFibersSettled([nf2], FIBER_DISPOSE_TIMEOUT_MS, [match])
+          const stateNow = FIBER_NAMES[nf2.state] ?? String(nf2.state)
+          const notes = [...abandoned, ...settled.unsettled]
+          if (stateNow !== 'active') {
+            return `ERROR: entry 重建后新 fiber 未转 active（state=${stateNow}）`
+              + (notes.length ? '\n- ' + notes.join('\n- ') : '')
+              + '\n该插件已处于不可用状态，需修复插件自身（apply 永不 settle / 抛错）后重载。'
+          }
+          return `OK: registry 无 runtime，entry.fiber 直接重建（${match} → active）`
+            + (notes.length ? '\n⚠ 旧代清理未完成：\n- ' + notes.join('\n- ') : '')
         } catch (e) {
           return 'ERROR: entry 重建失败: ' + (e instanceof Error ? e.stack : String(e))
+            + (abandoned.length ? '\n- ' + abandoned.join('\n- ') : '')
         }
       }
       return 'ERROR: registry 中无该插件 runtime 且 entry 无 fiber'
@@ -1260,6 +1398,7 @@ export function apply(ctx: AppContext, config: Config): void {
     // 必须在 dispose 之前完成。
     const fibers = [...runtime.fibers] as any[]
     const failures: string[] = []
+    const abandoned: string[] = []
     let rebuilt = 0
     try {
       const config = currentConfigOf(fibers[0]?._config)
@@ -1268,16 +1407,13 @@ export function apply(ctx: AppContext, config: Config): void {
       // 再建新 fiber，否则新 fiber apply 时旧注册残留 → duplicate（此前热
       // 重载连环 "already registered" 的根因）。registry.delete 是 fire-and-forget，
       // 所以这里直接 await entry.fiber 的 dispose（返回 disposalTask Promise）。
+      // ⚠️ 超时兜底：apply() 永不 settle 时 dispose 永不落定（2026-09-11 事故），
+      // 裸 await 会把工具调用和 opChain 一起挂死——超时后放弃该代旧 fiber 继续重建。
       const entryForDispose = [...ctx.loader.entries()].find((en) => {
         const o = en.options as { name?: string }
         return o?.name && String(o.name).includes(match)
       })
-      const oldFiberEntry = entryForDispose?.fiber
-      if (oldFiberEntry && typeof oldFiberEntry.dispose === 'function') {
-        try {
-          await oldFiberEntry.dispose()
-        } catch { /* dispose 清理失败不阻塞重建 */ }
-      }
+      await disposeFiberSafely(entryForDispose?.fiber, match, (m) => abandoned.push(m))
       ctx.registry.delete(oldPlugin)
       const newFibers: any[] = []
       for (const oldFiber of fibers) {
@@ -1296,10 +1432,14 @@ export function apply(ctx: AppContext, config: Config): void {
       // !entry.disabled 检查、activeEntry 查找）会基于不稳定状态失败（实测
       // reload 报 client ✗ 的根因：activeEntry=none → fullName 回落短名 →
       // processOne 精确匹配失败；reload 返回后 fiber 才转 active 补注册）。
-      await Promise.allSettled(newFibers.map((f) => {
-        const p = typeof f.await === 'function' ? f.await() : undefined
-        return p ?? Promise.resolve()
-      }))
+      // ⚠️ 带超时：apply() 永不 settle 时这里同样会永久挂住（同一事故的第二处
+      // 裸 await）——超时只登记，由下游 activeEntry 判定后如实回报，绝不挂死。
+      const settled = await awaitFibersSettled(
+        newFibers,
+        FIBER_DISPOSE_TIMEOUT_MS,
+        newFibers.map((_f, i) => `${match}#${i}`),
+      )
+      if (settled.unsettled.length) abandoned.push(...settled.unsettled)
     } catch (e) {
       // 整体失败：回滚缓存 + 用旧插件重建
       for (const [u, job] of backup) loadCache.set(u, job)
@@ -1329,6 +1469,23 @@ export function apply(ctx: AppContext, config: Config): void {
     }
     // 清 disabled（幽灵 entry 隔离）：热重载后 client 模块可重新注册（UI 生效）
     normalizeEntriesByName(match)
+    // ⚠️ 成功判定必须以「entry.fiber 真的 active」为准，而不是 dispose/import 没抛错：
+    // apply() 永不 settle 时既没抛错也没转 active，此前一律回报 OK，调用方据此
+    // 继续操作半启动实例（2026-09-11 事故的直接诱因）。
+    const activeConcreteEntry = [...ctx.loader.entries()].find((en) => {
+      const o = en.options
+      return !o.group && String(o.name).includes(match) && en.fiber && FIBER_NAMES[en.fiber.state] === 'active'
+    })
+    if (!activeConcreteEntry) {
+      const states = [...ctx.loader.entries()]
+        .filter((en) => !en.options.group && String(en.options.name).includes(match))
+        .map((en) => `${en.id}=${en.fiber ? (FIBER_NAMES[en.fiber.state] ?? '?') : 'no-fiber'}`)
+      return `ERROR: ${match} 重载未生效——没有任何 loader entry 的 fiber 转为 active`
+        + `（重建 ${rebuilt}/${fibers.length}）`
+        + (states.length ? `\n- entry 状态: ${states.join(', ')}` : '')
+        + (abandoned.length ? '\n- ' + abandoned.join('\n- ') : '')
+        + '\n插件 apply() 疑似永不 settle（既不抛错也不完成）→ 该插件当前不可用，需先修插件自身。'
+    }
     // ⚠️ 以下 client 操作必须用**完整包名**：client-modules 的 processOne 对
     // entry.options.name 做精确匹配（短名 ≠ '@dsh-external/...' 完整包名），
     // 传短名会静默注册失败（实测 reload 报 client ✗ 的根因——microtask flush
@@ -1361,6 +1518,7 @@ export function apply(ctx: AppContext, config: Config): void {
     const client = clientStatus(fullName)
     recordOp('reload', rebuilt > 0)
     return `OK: ${match} 热重载完成（清缓存 ${urls.length} 模块，重建 ${rebuilt} fiber）\n- ${client}`
+      + (abandoned.length ? '\n⚠ 旧代清理未完成（已超时放弃，不影响新代）：\n- ' + abandoned.join('\n- ') : '')
   }
 
   // ============ 插件状态 ============
@@ -1885,9 +2043,8 @@ export function apply(ctx: AppContext, config: Config): void {
         void (async () => {
           try {
             // 1. dispose 幽灵（当前运行实例=自杀；effect 已修，残留自动注销）
-            if (ghostRef.fiber && typeof ghostRef.fiber.dispose === 'function') {
-              await ghostRef.fiber.dispose()
-            }
+            //    带超时：幽灵若卡在 apply() 中，裸 await 会让仲裁路径永久挂住。
+            await disposeFiberSafely(ghostRef.fiber, `arbitrate:${ghostRef.id}`, (m) => auditLog('arbitrate-dispose-timeout', m))
             // 2. 移除幽灵 entry
             try { await ghostRef.parent.remove(ghostRef.id, true) } catch { /* 移除失败不阻塞 */ }
             // 3. 恢复官方（清 disabled + 清 disposed fiber + refresh）
