@@ -208,3 +208,23 @@ rm -rf ~/.dsh/profiles/web/node_modules/@yjh051108/dsh-super-injector
 
 **仓库**：https://github.com/yjh051108/dsh-super-injector
 **Releases**：https://github.com/yjh051108/dsh-super-injector/releases
+
+## 本机部署位置（2026-09-14）
+
+本机的 DSH profile 以 **link 依赖**指向本仓库的**工作树**（不再指向 `dsh-routing-suite/injector-release`）：
+
+| profile | 依赖 |
+|---|---|
+| `~/.dsh/profiles/web` | `"@dsh-external/dsh-super-injector": "link:/home/h/app/dsh-super-injector"` |
+| `~/.dsh/profiles/web-official` | 同上 |
+
+`web` / `web-official` 的 `dsh.profile.bundles` 里含 `@dsh-external/dsh-super-injector` ⇒ **启动即加载**；
+沙箱 profile（`sbx`）只声明依赖、不进 bundles ⇒ 不加载（不需要灯塔/日志来确认）。
+
+**⚠ 新家必须自带 `node_modules`**：`lib/index.js` 会 `import` `@deepseek-ai/dsh-tools`、`schemastery` 等，
+Node 从**模块的真实路径**向上解析 ⇒ 缺了这份 node_modules 会在运行期报解析失败（`node_modules` 被 .gitignore 忽略，
+拷贝/克隆时要单独搬，或按 `package.json` 重装）。验证一行：
+
+```bash
+cd ~/.dsh/profiles/web && node -e "import('@dsh-external/dsh-super-injector').then(m=>console.log('OK',m.name))"
+```
